@@ -1,0 +1,44 @@
+{
+	"name": "brain-graph",
+	"displayName": "Brain Graph",
+	"description": "Locally-hosted, Obsidian-style knowledge graph with VS Code integration",
+	"version": "0.1.0",
+	"publisher": "brain-graph",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Orlando-adam/brain-graph"
+	},
+	"engines": {
+		"vscode": "^1.74.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "brainGraph.open",
+				"title": "Open Brain Graph",
+				"category": "Brain Graph"
+			}
+		],
+		"keybindings": [
+			{
+				"command": "brainGraph.open",
+				"key": "ctrl+alt+g",
+				"mac": "cmd+alt+g",
+				"when": "!terminalFocus"
+			}
+		]
+	},
+	"__metadata": {
+		"installedTimestamp": 1780555882203,
+		"targetPlatform": "undefined",
+		"size": 12559
+	}
+}

@@ -1,0 +1,16 @@
+{
+  "scan_dirs": [
+    "~/Notes",
+    "~/Documents",
+    "~/Obsidian"
+  ],
+  "write_dir": "~/Notes",
+  "port": 4322,
+  "poll_secs": 3,
+  "home_max_depth": 2,
+  "exclude": [
+    "node_modules", ".git", "__pycache__", "dist", "build",
+    ".next", ".obsidian", "Library", "Applications"
+  ],
+  "pdftotext": ""
+}
