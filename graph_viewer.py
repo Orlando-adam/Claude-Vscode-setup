@@ -1035,6 +1035,7 @@ let selectedNode = null;
 let dirty = false;
 let currentPath = null;
 const _hiddenKinds = new Set(["similar", "temporal"]); // off by default
+const _hiddenExts = new Set();   // filetype filters toggled off
 
 const PALETTE = ["#6c63ff","#ff6584","#43c6ac","#f8b400","#e040fb","#00bcd4","#ff7043","#66bb6a","#ec407a","#26c6da"];
 const FOLDER_COLORS = {};
@@ -1693,8 +1694,6 @@ function flashMessage(msg) {
 }
 
 // ── Folder / filetype filter ──────────────────────────────────────────────
-const _hiddenExts = new Set();   // exts toggled off
-
 function populateFolderFilter() {
   const sel = document.getElementById("folder-filter");
   const folders = [...new Set(GRAPH.nodes.map(n => n.folder))].sort();
@@ -1736,10 +1735,6 @@ function applyFilters() {
     });
   }
 }
-
-// Re-populate folder list whenever graph updates
-const _origBuildGraph = buildGraph;
-// Wrap after initial definition — see below, called after buildGraph defined
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────
 document.addEventListener("keydown", e => {
