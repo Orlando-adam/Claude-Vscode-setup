@@ -5,40 +5,67 @@ Run:  python3 ~/ProductBrain/graph_viewer.py
 Open: http://localhost:4322
 """
 
-import json, os, re, subprocess, threading, time, urllib.parse, zipfile
+import json, math, os, platform, re, shutil, subprocess, threading, time, urllib.parse, zipfile
 from collections import defaultdict
+from datetime import datetime
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# Defaults — all overridable via ~/.brain-graph.json
 
 HOME = Path.home()
-SCAN_DIRS = [
-    HOME / "ProductBrain",          # rename to match your own folder
-    HOME / "Documents" / "Notes",
-    HOME / "Documents" / "Work",
-    HOME / "Documents" / "Learning",
-    HOME / "Downloads",
-    HOME / ".claude",
-    HOME,                           # picks up home-level docs (limited depth)
-]
-WRITE_DIR = HOME / "ProductBrain"   # rename to match your own folder
-EXTENSIONS = {".md", ".docx", ".pdf", ".txt"}
-EXCLUDE = {
-    "node_modules", ".git", "__pycache__", "dist", "build", ".next",
-    "skills", ".obsidian", "_deps", "cmake", "Library", "Applications",
-    "Movies", "Music", "Pictures", "Public", "Desktop",
-    ".cache", ".npm", ".vscode",
+_CONFIG_FILE = HOME / ".brain-graph.json"
+
+_DEFAULTS = {
+    "scan_dirs": [
+        str(HOME / "ProductBrain"),
+        str(HOME / "Documents" / "Notes"),
+        str(HOME / "Documents" / "Work"),
+        str(HOME / "Documents" / "Learning"),
+        str(HOME / "Downloads"),
+        str(HOME / ".claude"),
+        str(HOME),
+    ],
+    "write_dir":       str(HOME / "ProductBrain"),
+    "port":            4322,
+    "poll_secs":       5,
+    "home_max_depth":  2,
+    "pdftotext":       "/opt/homebrew/bin/pdftotext",
+    "exclude": [
+        "node_modules", ".git", "__pycache__", "dist", "build", ".next",
+        "skills", ".obsidian", "_deps", "cmake", "Library", "Applications",
+        "Movies", "Music", "Pictures", "Public", "Desktop",
+        ".cache", ".npm", ".vscode",
+    ],
 }
-HOME_MAX_DEPTH = 2                            # how deep to scan from $HOME (after the dedicated dirs)
-PORT = 4322
-POLL_SECS = 5
-PDFTOTEXT = "/opt/homebrew/bin/pdftotext"
+
+def _load_config() -> dict:
+    cfg = dict(_DEFAULTS)
+    if _CONFIG_FILE.exists():
+        try:
+            user = json.loads(_CONFIG_FILE.read_text())
+            cfg.update(user)
+        except Exception as e:
+            print(f"Warning: could not parse {_CONFIG_FILE}: {e}")
+    return cfg
+
+_CFG = _load_config()
+
+SCAN_DIRS      = [Path(d) for d in _CFG["scan_dirs"]]
+WRITE_DIR      = Path(_CFG["write_dir"])
+EXTENSIONS     = {".md", ".docx", ".pdf", ".txt"}
+EXCLUDE        = set(_CFG["exclude"])
+HOME_MAX_DEPTH = int(_CFG["home_max_depth"])
+PORT           = int(_CFG["port"])
+POLL_SECS      = int(_CFG["poll_secs"])
+PDFTOTEXT      = str(_CFG["pdftotext"])
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
-_text_cache: dict = {}   # path -> (mtime, text, word_set)
+_text_cache: dict = {}      # path -> (mtime, text, word_set)
+_tfidf_cache: dict = {}     # path -> (mtime, tfidf_top_set)
 _cache_lock = threading.Lock()
 _WORD_RE = re.compile(r'(?i)\b\w{4,}\b')
 
@@ -345,8 +372,7 @@ def scan():
         m = _date_re.search(n["name"])
         if m:
             try:
-                from datetime import datetime
-                ts = datetime.strptime(m.group(1).replace('_', '-'), '%Y-%m-%d').timestamp()
+                        ts = datetime.strptime(m.group(1).replace('_', '-'), '%Y-%m-%d').timestamp()
                 dated.append((ts, pid))
             except ValueError:
                 pass
@@ -366,7 +392,6 @@ def scan():
     # ── Pass 8: TF-IDF content similarity ────────────────────────────────────
     # Link files whose content is genuinely similar, not just same-named tokens.
     # Only run over MD files + cached text. Top-N similar pairs per file linked.
-    import math
     all_texts: dict = {}  # pid -> word_set (already computed)
     for pid, content in md_contents.items():
         ws = extract_words(content)
@@ -385,7 +410,6 @@ def scan():
         for ws in all_texts.values():
             for w in ws:
                 df[w] += 1
-        # Build TF-IDF vectors (sparse: only top-K words by IDF weight per doc)
         TOP_K = 30
         idf = {w: math.log(doc_count / (1 + c)) for w, c in df.items() if c < doc_count * 0.6}
 
@@ -394,12 +418,29 @@ def scan():
             scored.sort(reverse=True)
             return {w for _, w in scored[:TOP_K]}
 
-        tfidf_vecs = {pid: tfidf_top(ws) for pid, ws in all_texts.items()}
+        # Build TF-IDF vectors — reuse cached result when file mtime unchanged
+        tfidf_vecs: dict = {}
+        with _cache_lock:
+            tfidf_snap = dict(_tfidf_cache)
+        for pid, ws in all_texts.items():
+            try:
+                mtime = Path(pid).stat().st_mtime
+            except Exception:
+                mtime = 0
+            cached = tfidf_snap.get(pid)
+            if cached and cached[0] == mtime:
+                vec = cached[1]
+            else:
+                vec = tfidf_top(ws)
+                with _cache_lock:
+                    _tfidf_cache[pid] = (mtime, vec)
+            if vec:
+                tfidf_vecs[pid] = vec
 
         # Jaccard similarity on TF-IDF top-K vectors
         pid_list2 = list(tfidf_vecs.keys())
-        SIM_THRESHOLD = 0.25   # at least 25% Jaccard overlap on top-K TF-IDF words
-        MAX_LINKS = 2           # max tfidf links per file
+        SIM_THRESHOLD = 0.25
+        MAX_LINKS = 2
         tfidf_count: dict = defaultdict(int)
 
         for i, pid_a in enumerate(pid_list2):
@@ -496,11 +537,21 @@ def watcher():
         if current != State.mtimes:
             prev = State.mtimes
             State.mtimes = current
-            # Invalidate cache for changed or new files
+            # Invalidate cache only for changed/new/deleted files
             changed = {p for p, m in current.items() if prev.get(p) != m}
-            for p in changed:
-                with _cache_lock:
+            deleted = {p for p in prev if p not in current}
+            with _cache_lock:
+                for p in changed | deleted:
                     _text_cache.pop(p, None)
+                    _tfidf_cache.pop(p, None)
+            # Re-extract only changed non-md files, then rebuild graph once
+            non_md_changed = [p for p in changed if not p.endswith(".md")]
+            if non_md_changed:
+                threads = [threading.Thread(
+                    target=lambda p=p: extract_text(Path(p)), daemon=True
+                ) for p in non_md_changed]
+                for t in threads: t.start()
+                for t in threads: t.join()
             rescan_and_push()
 
 # ── HTTP Handler ──────────────────────────────────────────────────────────────
@@ -568,22 +619,39 @@ class Handler(BaseHTTPRequestHandler):
             with State.lock:
                 nodes = list(State.nodes)
             for node in nodes:
+                name_l = node["name"].lower()
                 content = extract_text(Path(node["path"]))
-                if not content:
+                cl = content.lower() if content else ""
+
+                name_match = q in name_l
+                body_count = cl.count(q) if cl else 0
+
+                if not name_match and body_count == 0:
                     continue
-                cl = content.lower()
-                if q in cl:
-                    idx = cl.find(q)
+
+                # Score: filename match = 100 bonus + body frequency
+                score = (100 if name_match else 0) + body_count
+
+                idx = cl.find(q) if cl else -1
+                if idx >= 0:
                     start = max(0, idx - 80)
                     end   = min(len(content), idx + 160)
                     excerpt = content[start:end].replace("\n", " ").strip()
-                    results.append({
-                        "name":    node["name"],
-                        "path":    node["path"],
-                        "folder":  node["folder"],
-                        "ext":     node["ext"],
-                        "excerpt": excerpt,
-                    })
+                else:
+                    excerpt = ""
+
+                results.append({
+                    "name":    node["name"],
+                    "path":    node["path"],
+                    "folder":  node["folder"],
+                    "ext":     node["ext"],
+                    "excerpt": excerpt,
+                    "score":   score,
+                })
+
+            results.sort(key=lambda r: r["score"], reverse=True)
+            for r in results:
+                del r["score"]
             self._respond(200, "application/json", json.dumps(results).encode())
 
         elif p.path == "/":
@@ -623,7 +691,16 @@ class Handler(BaseHTTPRequestHandler):
             allowed = any(str(path).startswith(str(d)) for d in SCAN_DIRS)
             if not allowed:
                 self.send_error(403); return
-            path.unlink(missing_ok=True)
+            if path.exists():
+                if platform.system() == "Darwin":
+                    trash = Path.home() / ".Trash" / path.name
+                    # Avoid name collision in Trash
+                    if trash.exists():
+                        stem, suffix = path.stem, path.suffix
+                        trash = Path.home() / ".Trash" / f"{stem}_{int(time.time())}{suffix}"
+                    shutil.move(str(path), str(trash))
+                else:
+                    path.unlink(missing_ok=True)
             self._respond(200, "application/json", b'{"ok":true}')
 
         else:
@@ -807,6 +884,14 @@ btn, button {
 .toggle-link { cursor: pointer; opacity: 0.35; transition: opacity 0.15s; user-select: none; }
 .toggle-link.active { opacity: 1; }
 
+/* Filetype filter toggles */
+.ext-toggle {
+  cursor: pointer; user-select: none; font-size: 10px; font-weight: 600;
+  padding: 2px 7px; border-radius: 4px; border: 1px solid #333;
+  color: #555; background: #1e1e22; transition: color 0.12s, border-color 0.12s;
+}
+.ext-toggle.active { color: #aaa; border-color: #6c63ff66; }
+
 /* Tooltip */
 #graph-tooltip {
   position: fixed;
@@ -865,6 +950,17 @@ btn, button {
       <button class="btn-new" onclick="openNewModal()">+ New note</button>
     </div>
     <input id="search" type="text" placeholder="Search files..." oninput="onSearch(this.value)">
+    <div class="header-row" id="filter-row" style="gap:8px;flex-wrap:wrap;">
+      <select id="folder-filter" onchange="applyFilters()" style="background:#1e1e22;border:1px solid #333;border-radius:5px;color:#aaa;font-size:11px;padding:4px 8px;flex:1;min-width:0;">
+        <option value="">All folders</option>
+      </select>
+      <div id="ext-filters" style="display:flex;gap:4px;flex-shrink:0;">
+        <span class="ext-toggle active" data-ext="md"   onclick="toggleExt(this)">MD</span>
+        <span class="ext-toggle active" data-ext="pdf"  onclick="toggleExt(this)">PDF</span>
+        <span class="ext-toggle active" data-ext="docx" onclick="toggleExt(this)">DOCX</span>
+        <span class="ext-toggle active" data-ext="txt"  onclick="toggleExt(this)">TXT</span>
+      </div>
+    </div>
   </div>
 
   <div id="file-info">
@@ -931,6 +1027,7 @@ btn, button {
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 let GRAPH = __GRAPH_DATA__;
@@ -1053,6 +1150,7 @@ function buildGraph(data) {
   });
 
   updateStats();
+  if (typeof populateFolderFilter === "function") populateFolderFilter();
 
   // Re-select previously selected node if still exists
   if (selectedNode) {
@@ -1294,6 +1392,8 @@ function clearHighlight() {
 
 function applyLinkVisibility() {
   if (linkSel) linkSel.style("display", l => _hiddenKinds.has(l.kind) ? "none" : null);
+  // Re-apply folder/ext filters if active
+  if (typeof applyFilters === "function") applyFilters();
 }
 
 function toggleLinkKind(kind, el) {
@@ -1442,43 +1542,42 @@ function connectSSE() {
 }
 connectSSE();
 
-// ── Markdown renderer ─────────────────────────────────────────────────────
-function renderMd(text) {
-  if (!text) return '<div class="placeholder">Empty file</div>';
-  let h = text
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/```[\w]*\n([\s\S]*?)```/g, (_, c) => `<pre><code>${c}</code></pre>`)
-    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-    .replace(/^#### (.+)$/gm, "<h4>$1</h4>")
-    .replace(/^### (.+)$/gm,  "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm,   "<h2>$1</h2>")
-    .replace(/^# (.+)$/gm,    "<h1>$1</h1>")
-    .replace(/^---+$/gm, "<hr>")
-    .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
-    .replace(/\*\*(.+?)\*\*/g,     "<strong>$1</strong>")
-    .replace(/\*([^*\n]+)\*/g,     "<em>$1</em>")
-    .replace(/^&gt; (.+)$/gm, "<blockquote>$1</blockquote>")
-    .replace(/^\- (.+)$/gm,   "<li>$1</li>")
-    .replace(/^\* (.+)$/gm,   "<li>$1</li>")
-    .replace(/^\d+\. (.+)$/gm,"<li>$1</li>")
-    .replace(/(<li>[\s\S]+?<\/li>)/g, m => "<ul>" + m + "</ul>")
-    // Wikilinks first  ([[Note]] or [[Note|Alias]])
-    .replace(/\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]/g, (_, target, alias) => {
-      const label = alias || target;
-      return `<a href="#" class="wikilink" data-target="${escapeAttr(target.trim())}">${escapeAttr(label.trim())}</a>`;
-    })
-    // Markdown links: external opens new tab, internal stays internal
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
-      if (/^(https?:|mailto:)/.test(url)) return `<a href="${url}" target="_blank">${label}</a>`;
-      return `<a href="#" class="mdlink" data-target="${escapeAttr(url)}">${label}</a>`;
-    })
-    .replace(/\n\n+/g, "</p><p>")
-    .replace(/\n/g, "<br>");
-  return "<p>" + h + "</p>";
-}
-
+// ── Markdown renderer (marked.js) ─────────────────────────────────────────
 function escapeAttr(s) {
   return String(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function renderMd(text) {
+  if (!text) return '<div class="placeholder">Empty file</div>';
+
+  // Pre-process: convert [[wikilinks]] to a placeholder marked.js won't mangle
+  const wikilinkMap = {};
+  let wlIdx = 0;
+  text = text.replace(/\[\[([^\]|#\n]+)(?:\|([^\]\n]+))?\]\]/g, (_, target, alias) => {
+    const key = `WIKILINK_${wlIdx++}_`;
+    const label = (alias || target).trim();
+    wikilinkMap[key] = `<a href="#" class="wikilink" data-target="${escapeAttr(target.trim())}">${escapeHtml(label)}</a>`;
+    return key;
+  });
+
+  // Configure marked: open external links in new tab, intercept internal links
+  const renderer = new marked.Renderer();
+  const origLink = renderer.link.bind(renderer);
+  renderer.link = function(href, title, label) {
+    if (/^(https?:|mailto:)/.test(href || '')) {
+      return `<a href="${escapeAttr(href)}" target="_blank" rel="noopener">${label}</a>`;
+    }
+    return `<a href="#" class="mdlink" data-target="${escapeAttr(href || '')}">${label}</a>`;
+  };
+
+  marked.use({ renderer, breaks: true, gfm: true });
+  let html = marked.parse(text);
+
+  // Restore wikilinks
+  for (const [key, val] of Object.entries(wikilinkMap)) {
+    html = html.replace(key, val);
+  }
+  return html;
 }
 
 // Delegate clicks on rendered links
@@ -1524,6 +1623,113 @@ function flashMessage(msg) {
     setTimeout(() => s.textContent = "", 2500);
   }
 }
+
+// ── Folder / filetype filter ──────────────────────────────────────────────
+const _hiddenExts = new Set();   // exts toggled off
+
+function populateFolderFilter() {
+  const sel = document.getElementById("folder-filter");
+  const folders = [...new Set(GRAPH.nodes.map(n => n.folder))].sort();
+  // Keep only the "All folders" option, then re-add
+  sel.innerHTML = '<option value="">All folders</option>';
+  folders.forEach(f => {
+    const opt = document.createElement("option");
+    opt.value = f; opt.textContent = f;
+    sel.appendChild(opt);
+  });
+}
+
+function toggleExt(el) {
+  const ext = el.dataset.ext;
+  el.classList.toggle("active");
+  if (_hiddenExts.has(ext)) _hiddenExts.delete(ext);
+  else _hiddenExts.add(ext);
+  applyFilters();
+}
+
+function applyFilters() {
+  if (!nodeSel) return;
+  const folder = document.getElementById("folder-filter").value;
+  nodeSel.classed("dimmed", d => {
+    if (folder && d.folder !== folder) return true;
+    if (_hiddenExts.has(d.ext)) return true;
+    return false;
+  });
+  if (linkSel) {
+    linkSel.style("display", l => {
+      if (_hiddenKinds.has(l.kind)) return "none";
+      const s = l.source?.id ?? l.source, t = l.target?.id ?? l.target;
+      const sn = GRAPH.nodes.find(n => n.id === s);
+      const tn = GRAPH.nodes.find(n => n.id === t);
+      if (!sn || !tn) return null;
+      if (folder && (sn.folder !== folder || tn.folder !== folder)) return "none";
+      if (_hiddenExts.has(sn.ext) || _hiddenExts.has(tn.ext)) return "none";
+      return null;
+    });
+  }
+}
+
+// Re-populate folder list whenever graph updates
+const _origBuildGraph = buildGraph;
+// Wrap after initial definition — see below, called after buildGraph defined
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────
+document.addEventListener("keydown", e => {
+  const inInput = ["INPUT","TEXTAREA"].includes(document.activeElement?.tagName);
+
+  // Cmd/Ctrl+S — save when editor is open
+  if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+    const editorVisible = document.getElementById("editor").style.display !== "none";
+    if (editorVisible) { e.preventDefault(); saveFile(); }
+    return;
+  }
+
+  // Cmd/Ctrl+F — focus search
+  if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+    e.preventDefault();
+    const s = document.getElementById("search");
+    s.focus(); s.select();
+    return;
+  }
+
+  if (inInput) return; // don't hijack typing
+
+  // Escape — clear selection / close modal
+  if (e.key === "Escape") {
+    if (document.getElementById("modal-bg").classList.contains("open")) { closeModal(); return; }
+    clearHighlight();
+    selectedNode = null; currentPath = null;
+    document.getElementById("file-info").innerHTML = '<div class="placeholder">Click a node to open a file</div>';
+    document.getElementById("content-area").innerHTML = '<div class="placeholder">Nothing selected yet.</div>';
+    return;
+  }
+
+  // E — enter editor for selected markdown file
+  if (e.key === "e" && selectedNode?.ext === "md") {
+    enterEditor(); return;
+  }
+
+  // N — new note
+  if (e.key === "n") { openNewModal(); return; }
+
+  // Tab / Shift+Tab — cycle through neighbours of selected node
+  if (e.key === "Tab" && selectedNode) {
+    e.preventDefault();
+    const neighbours = [];
+    GRAPH.links.forEach(l => {
+      const s = l.source?.id ?? l.source, t = l.target?.id ?? l.target;
+      if (s === selectedNode.id) neighbours.push(t);
+      if (t === selectedNode.id) neighbours.push(s);
+    });
+    if (!neighbours.length) return;
+    const cur = neighbours.indexOf(hoveredId);
+    const next = e.shiftKey
+      ? neighbours[(cur - 1 + neighbours.length) % neighbours.length]
+      : neighbours[(cur + 1) % neighbours.length];
+    const node = GRAPH.nodes.find(n => n.id === next);
+    if (node) selectNode(node);
+  }
+});
 </script>
 </body>
 </html>"""

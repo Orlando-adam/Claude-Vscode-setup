@@ -4,9 +4,17 @@ const { spawn } = require('child_process');
 const os   = require('os');
 const path = require('path');
 
-const PORT          = 4322;
-const SERVER_SCRIPT = path.join(os.homedir(), 'ProductBrain', 'graph_viewer.py');
-const SERVER_URL    = `http://localhost:${PORT}`;
+function getConfig() {
+  const cfg = vscode.workspace.getConfiguration('brainGraph');
+  const port = cfg.get('port') || 4322;
+  const script = cfg.get('serverScript') ||
+    path.join(os.homedir(), 'brain-graph', 'graph_viewer.py');
+  return { port, script };
+}
+
+let _port = 4322;
+let SERVER_SCRIPT = path.join(os.homedir(), 'brain-graph', 'graph_viewer.py');
+let SERVER_URL    = `http://localhost:${_port}`;
 
 let panel         = null;
 let statusBarItem = null;
@@ -15,6 +23,20 @@ let sseReq        = null;
 // ── Activate ──────────────────────────────────────────────────────────────────
 
 function activate(context) {
+  // Apply config at activation time and on settings change
+  const applyConfig = () => {
+    const cfg = getConfig();
+    _port = cfg.port;
+    SERVER_SCRIPT = cfg.script;
+    SERVER_URL = `http://localhost:${_port}`;
+  };
+  applyConfig();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('brainGraph')) applyConfig();
+    })
+  );
+
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   statusBarItem.text    = '$(graph) Brain Graph';
   statusBarItem.tooltip = 'Open Brain Graph  (⌘⌥G)';

@@ -34,7 +34,22 @@
 				"mac": "cmd+alt+g",
 				"when": "!terminalFocus"
 			}
-		]
+		],
+		"configuration": {
+			"title": "Brain Graph",
+			"properties": {
+				"brainGraph.serverScript": {
+					"type": "string",
+					"default": "",
+					"description": "Path to graph_viewer.py. Defaults to ~/brain-graph/graph_viewer.py."
+				},
+				"brainGraph.port": {
+					"type": "number",
+					"default": 4322,
+					"description": "Port the Brain Graph server runs on."
+				}
+			}
+		}
 	},
 	"__metadata": {
 		"installedTimestamp": 1780555882203,
