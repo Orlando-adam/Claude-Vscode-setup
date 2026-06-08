@@ -1109,12 +1109,12 @@ function buildGraph(data) {
   if (sim) sim.stop();
 
   sim = d3.forceSimulation(GRAPH.nodes)
-    .alphaDecay(0.08)
-    .velocityDecay(0.5)
+    .alphaDecay(0.04)
+    .velocityDecay(0.45)
     .force("link", d3.forceLink(GRAPH.links).id(d => d.id)
       .distance(l => l.kind === "similar" ? 220 : l.kind === "mention" ? 160 : 130)
       .strength(l => l.kind === "similar" ? 0.05 : l.kind === "mention" ? 0.12 : 0.3))
-    .force("charge",    d3.forceManyBody().strength(d => -450 - (degreeMap[d.id] || 0) * 25).distanceMax(400).theta(0.9))
+    .force("charge",    d3.forceManyBody().strength(d => -450 - (degreeMap[d.id] || 0) * 25).distanceMax(600).theta(0.9))
     .force("center",    d3.forceCenter(W() / 2, H() / 2).strength(0.03))
     .force("x",         d3.forceX(W() / 2).strength(0.015))
     .force("y",         d3.forceY(H() / 2).strength(0.015))
@@ -1178,7 +1178,7 @@ function updateGraph(data) {
   // Update simulation data without full restart
   sim.nodes(GRAPH.nodes);
   sim.force("link").links(GRAPH.links);
-  sim.alpha(0.15).restart(); // gentle nudge, not a full reheat
+  sim.alpha(0.1).restart(); // gentle nudge, not a full reheat
 
   // Data-join links — add new, remove old
   linkSel = d3.select("#links-g").selectAll("line")
