@@ -372,7 +372,7 @@ def scan():
         m = _date_re.search(n["name"])
         if m:
             try:
-                        ts = datetime.strptime(m.group(1).replace('_', '-'), '%Y-%m-%d').timestamp()
+                ts = datetime.strptime(m.group(1).replace('_', '-'), '%Y-%m-%d').timestamp()
                 dated.append((ts, pid))
             except ValueError:
                 pass
