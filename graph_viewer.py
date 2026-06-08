@@ -1175,10 +1175,11 @@ function updateGraph(data) {
 
   _recomputeDegree();
 
-  // Update simulation data without full restart
+  // Update simulation data — don't cool it down if it's still spreading
   sim.nodes(GRAPH.nodes);
   sim.force("link").links(GRAPH.links);
-  sim.alpha(0.1).restart(); // gentle nudge, not a full reheat
+  const reheat = 0.1;
+  sim.alpha(Math.max(sim.alpha(), reheat)).restart();
 
   // Data-join links — add new, remove old
   linkSel = d3.select("#links-g").selectAll("line")
