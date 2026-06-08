@@ -1072,28 +1072,49 @@ let sim, linkSel, nodeSel;
 let degreeMap = {};
 let hoveredId = null;
 
-function buildGraph(data) {
-  GRAPH = data;
-
-  // Compute degree (link count) per node
+function _recomputeDegree() {
   degreeMap = {};
   GRAPH.links.forEach(l => {
     const s = l.source?.id ?? l.source, t = l.target?.id ?? l.target;
     degreeMap[s] = (degreeMap[s] || 0) + 1;
     degreeMap[t] = (degreeMap[t] || 0) + 1;
   });
+}
+
+function _attachNodeEvents(sel) {
+  sel
+    .call(d3.drag()
+      .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on("drag",  (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }))
+    .on("click",      (e, d) => { e.stopPropagation(); selectNode(d); })
+    .on("dblclick",   (e, d) => { e.stopPropagation(); zoomToNode(d); })
+    .on("mouseenter", (e, d) => { hoveredId = d.id; onHover(e, d); })
+    .on("mousemove",  (e, d) => { moveTooltip(e); })
+    .on("mouseleave", (e, d) => { hoveredId = null; offHover(d); });
+}
+
+function _tickHandler() {
+  linkSel.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+         .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+  nodeSel.attr("transform", d => `translate(${d.x},${d.y})`);
+}
+
+function buildGraph(data) {
+  GRAPH = data;
+  _recomputeDegree();
 
   d3.select("#links-g").selectAll("*").remove();
   d3.select("#nodes-g").selectAll("*").remove();
   if (sim) sim.stop();
 
   sim = d3.forceSimulation(GRAPH.nodes)
-    .alphaDecay(0.04)
-    .velocityDecay(0.4)
+    .alphaDecay(0.08)
+    .velocityDecay(0.5)
     .force("link", d3.forceLink(GRAPH.links).id(d => d.id)
       .distance(l => l.kind === "similar" ? 220 : l.kind === "mention" ? 160 : 130)
       .strength(l => l.kind === "similar" ? 0.05 : l.kind === "mention" ? 0.12 : 0.3))
-    .force("charge",    d3.forceManyBody().strength(d => -450 - (degreeMap[d.id] || 0) * 25).distanceMax(700).theta(0.9))
+    .force("charge",    d3.forceManyBody().strength(d => -450 - (degreeMap[d.id] || 0) * 25).distanceMax(400).theta(0.9))
     .force("center",    d3.forceCenter(W() / 2, H() / 2).strength(0.03))
     .force("x",         d3.forceX(W() / 2).strength(0.015))
     .force("y",         d3.forceY(H() / 2).strength(0.015))
@@ -1105,16 +1126,9 @@ function buildGraph(data) {
 
   nodeSel = d3.select("#nodes-g").selectAll("g")
     .data(GRAPH.nodes, d => d.id).join("g")
-    .attr("class", d => "node" + ((degreeMap[d.id] || 0) >= 5 ? " hub" : ""))
-    .call(d3.drag()
-      .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-      .on("drag",  (e, d) => { d.fx = e.x; d.fy = e.y; })
-      .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }))
-    .on("click",      (e, d) => { e.stopPropagation(); selectNode(d); })
-    .on("dblclick",   (e, d) => { e.stopPropagation(); zoomToNode(d); })
-    .on("mouseenter", (e, d) => { hoveredId = d.id; onHover(e, d); })
-    .on("mousemove",  (e, d) => { moveTooltip(e); })
-    .on("mouseleave", (e, d) => { hoveredId = null; offHover(d); });
+    .attr("class", d => "node" + ((degreeMap[d.id] || 0) >= 5 ? " hub" : ""));
+
+  _attachNodeEvents(nodeSel);
 
   nodeSel.append("circle")
     .attr("r", d => nodeR(d, degreeMap[d.id] || 0))
@@ -1131,28 +1145,81 @@ function buildGraph(data) {
     .text(d => d.name);
 
   updateLabels();
-
   applyLinkVisibility();
 
   let _lastRender = 0;
   sim.on("tick", () => {
     const now = performance.now();
-    if (now - _lastRender < 32) return; // ~30fps cap during simulation
+    if (now - _lastRender < 16) return;
     _lastRender = now;
-    linkSel.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-           .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-    nodeSel.attr("transform", d => `translate(${d.x},${d.y})`);
+    _tickHandler();
   });
-  sim.on("end", () => { // final position flush when simulation cools
-    linkSel.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-           .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-    nodeSel.attr("transform", d => `translate(${d.x},${d.y})`);
+  sim.on("end", _tickHandler);
+
+  _afterGraphUpdate();
+}
+
+// Incremental update — called on SSE events after first load.
+// Preserves existing node positions; only adds/removes changed elements.
+function updateGraph(data) {
+  const prevPositions = {};
+  GRAPH.nodes.forEach(n => { prevPositions[n.id] = { x: n.x, y: n.y, vx: n.vx, vy: n.vy }; });
+
+  GRAPH = data;
+
+  // Restore positions for nodes that still exist
+  GRAPH.nodes.forEach(n => {
+    const p = prevPositions[n.id];
+    if (p) { n.x = p.x; n.y = p.y; n.vx = p.vx; n.vy = p.vy; }
   });
 
+  _recomputeDegree();
+
+  // Update simulation data without full restart
+  sim.nodes(GRAPH.nodes);
+  sim.force("link").links(GRAPH.links);
+  sim.alpha(0.15).restart(); // gentle nudge, not a full reheat
+
+  // Data-join links — add new, remove old
+  linkSel = d3.select("#links-g").selectAll("line")
+    .data(GRAPH.links, (l, i) => `${l.source?.id ?? l.source}-${l.target?.id ?? l.target}-${l.kind}`)
+    .join("line")
+    .attr("class", l => "link kind-" + (l.kind || "link"));
+
+  // Data-join nodes — add new, remove old, keep existing
+  nodeSel = d3.select("#nodes-g").selectAll("g")
+    .data(GRAPH.nodes, d => d.id)
+    .join(
+      enter => {
+        const g = enter.append("g")
+          .attr("class", d => "node" + ((degreeMap[d.id] || 0) >= 5 ? " hub" : ""));
+        _attachNodeEvents(g);
+        g.append("circle")
+          .attr("r", d => nodeR(d, degreeMap[d.id] || 0))
+          .attr("fill", d => d.ext === "md" ? folderColor(d.folder) : "#0d0d0f")
+          .attr("fill-opacity", d => d.ext === "md" ? 0.8 : 1)
+          .attr("stroke", d => folderColor(d.folder))
+          .attr("stroke-width", d => d.ext === "md" ? 1.5 : 2)
+          .attr("stroke-opacity", d => d.ext === "md" ? 0.35 : 0.9);
+        g.append("text")
+          .attr("dx", d => nodeR(d, degreeMap[d.id] || 0) + 5)
+          .attr("dy", "0.35em")
+          .attr("font-size", (LABEL_PX / currentZoom) + "px")
+          .text(d => d.name);
+        return g;
+      },
+      update => update.attr("class", d => "node" + ((degreeMap[d.id] || 0) >= 5 ? " hub" : "")),
+      exit   => exit.remove()
+    );
+
+  applyLinkVisibility();
+  updateLabels();
+  _afterGraphUpdate();
+}
+
+function _afterGraphUpdate() {
   updateStats();
   if (typeof populateFolderFilter === "function") populateFolderFilter();
-
-  // Re-select previously selected node if still exists
   if (selectedNode) {
     const still = GRAPH.nodes.find(n => n.id === selectedNode.id);
     if (still) highlight(still);
@@ -1532,7 +1599,7 @@ function connectSSE() {
   const es = new EventSource("/events");
   es.onmessage = e => {
     const data = JSON.parse(e.data);
-    buildGraph(data);
+    if (sim) updateGraph(data); else buildGraph(data);
   };
   es.onerror = () => {
     document.getElementById("live-dot").classList.remove("live");
